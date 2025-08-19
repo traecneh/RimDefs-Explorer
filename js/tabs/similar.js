@@ -1,9 +1,11 @@
 // Tag Values tab: lists tags of the current XML and lets you explore their values
 // across *visible* defs via two on-demand tables ("Unique" and "All") with
-// click-to-sort (numeric or alpha). No external deps.
+// click-to-sort (numeric or alpha). Now with pills in All + clickable defName links.
 
 import { h, clear, on } from '../core/dom.js';
 import { matches as matchesRec } from '../core/search.js';
+import { makePill } from '../ui/badges.js';
+import { modColor, defTypeColor } from '../core/colors.js';
 
 // Public entry used by detailsView
 export function renderSimilar(item, store) {
@@ -60,6 +62,7 @@ export function renderSimilar(item, store) {
 
     // Render header + table
     clear(results);
+    const table = buildSortableTable(tableModel, store).el;
     results.append(
       h('div', { class: 'tv-title' },
         h('strong', {}, tag), ' — ',
@@ -67,7 +70,7 @@ export function renderSimilar(item, store) {
         h('span', { class: 'spacer' }),
         h('span', { class: 'muted' }, `${tableModel.rows.length} row${tableModel.rows.length === 1 ? '' : 's'}`)
       ),
-      buildSortableTable(tableModel).el
+      table
     );
   });
 
@@ -121,6 +124,7 @@ function datasetAll(items, tag) {
     const arr = toArray(it.tagMap?.[tag]);
     for (const v of arr) {
       rows.push({
+        layer: it.layer || '',           // keep for pill coloring
         source: it.modDisplay || '',
         defType: it.defType || '',
         defName: it.defName || '',
@@ -134,11 +138,35 @@ function datasetAll(items, tag) {
     cmpAlpha(a.defType, b.defType) ||
     cmpAlpha(a.defName, b.defName)
   );
+
   return {
     columns: [
-      { key: 'source', label: 'Source' },
-      { key: 'defType', label: 'DefType' },
-      { key: 'defName', label: 'defName' },
+      // Show Source as a pill with the correct color
+      {
+        key: 'source',
+        label: 'Source',
+        render: (r) => makePill('mod', r.source || '(unknown)', modColor(r.layer, r.source || '')),
+        sortVal: (r) => r.source || ''
+      },
+      // Show DefType as a pill too
+      {
+        key: 'defType',
+        label: 'DefType',
+        render: (r) => makePill('type', r.defType || '(none)', defTypeColor(r.defType)),
+        sortVal: (r) => r.defType || ''
+      },
+      // defName: clickable link → selects the item and jumps to top
+      {
+        key: 'defName',
+        label: 'defName',
+        render: (r) => h('a', {
+          href: '#',
+          class: 'deflink',
+          dataset: { defType: r.defType || '', defName: r.defName || '' },
+          title: `${r.defType}/${r.defName}`
+        }, r.defName || '(no defName)'),
+        sortVal: (r) => r.defName || ''
+      },
       { key: 'value', label: 'Value' }
     ],
     rows
@@ -152,7 +180,7 @@ function toArray(v) {
 
 /* --------------------------- table builder --------------------------- */
 
-function buildSortableTable(model) {
+function buildSortableTable(model, store) {
   const table = h('table', { class: 'tv-table' });
   let sortKey = model.columns[0]?.key || '';
   let sortDir = 'asc';
@@ -160,13 +188,15 @@ function buildSortableTable(model) {
 
   function render() {
     clear(table);
+
     const thead = h('thead', {},
       h('tr', {},
         ...model.columns.map(col => {
           const th = h('th', {
             tabindex: '0',
             dataset: { key: col.key },
-            'aria-sort': sortKey === col.key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'
+            'aria-sort': sortKey === col.key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none',
+            title: 'Click to sort'
           }, col.label);
           th.addEventListener('click', () => toggleSort(col.key));
           th.addEventListener('keydown', (e) => {
@@ -178,7 +208,21 @@ function buildSortableTable(model) {
     );
 
     const tbody = h('tbody', {},
-      ...rows.map(r => h('tr', {}, ...model.columns.map(c => h('td', {}, String(r[c.key] ?? '')))))
+      ...rows.map(r => {
+        const tr = h('tr', {});
+        for (const col of model.columns) {
+          const td = h('td', {});
+          if (typeof col.render === 'function') {
+            const node = col.render(r);
+            if (node instanceof Node) td.appendChild(node);
+            else td.textContent = String(node ?? '');
+          } else {
+            td.textContent = String(r[col.key] ?? '');
+          }
+          tr.appendChild(td);
+        }
+        return tr;
+      })
     );
 
     table.append(thead, tbody);
@@ -193,11 +237,30 @@ function buildSortableTable(model) {
 
   function applySort() {
     const col = model.columns.find(c => c.key === sortKey);
-    const numericHint = !!col?.numeric;
-    const numericDetected = numericHint || deduceNumeric(rows, sortKey);
-    rows.sort((a, b) => cmpFlexible(a[sortKey], b[sortKey], numericDetected));
+    const getVal = col && typeof col.sortVal === 'function'
+      ? (r) => col.sortVal(r)
+      : (r) => r[sortKey];
+
+    const numericDetected = deduceNumeric(rows.map(r => getVal(r)));
+    rows.sort((a, b) => cmpFlexible(getVal(a), getVal(b), numericDetected));
     if (sortDir === 'desc') rows.reverse();
   }
+
+  // Click handling for defName links: select and jump to top
+  on(table, 'click', 'a.deflink', (ev, a) => {
+    ev.preventDefault();
+    const defType = a.dataset.defType || '';
+    const defName = a.dataset.defName || '';
+    if (!defType || !defName) return;
+
+    const it = store.findDef(defType, defName);
+    if (!it) return;
+
+    // Tell the app to select this item (boot.js listens for 'rimdefs:select')
+    window.dispatchEvent(new CustomEvent('rimdefs:select', { detail: { key: it.key } }));
+    // Jump to header/top immediately
+    window.scrollTo(0, 0);
+  });
 
   applySort();
   render();
@@ -206,16 +269,14 @@ function buildSortableTable(model) {
 
 /* --------------------------- comparators --------------------------- */
 
-function deduceNumeric(rows, key) {
-  if (!rows.length) return false;
+function deduceNumeric(values) {
+  if (!values || !values.length) return false;
   let numLike = 0;
-  for (const r of rows) {
-    const v = r[key];
-    if (v == null) continue;
+  for (const v of values) {
     const n = Number.parseFloat(v);
     if (Number.isFinite(n)) numLike++;
   }
-  return numLike / rows.length > 0.6; // >60% looks numeric → treat as numeric
+  return numLike / values.length > 0.6; // >60% looks numeric → treat as numeric
 }
 
 function cmpFlexible(a, b, numeric) {
